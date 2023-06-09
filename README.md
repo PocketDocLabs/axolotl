@@ -387,7 +387,6 @@ train_on_inputs: false
 # don't use this, leads to wonky training (according to someone on the internet)
 group_by_length: false
 
-# does not work with current implementation of 4-bit LoRA
 gradient_checkpointing: false
 
 # stop training after this many evaluation losses have increased in a row
