@@ -9,12 +9,12 @@ jobs:
     name: pre-commit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-python@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.10"
           cache: 'pip' # caching pip dependencies
-      - uses: pre-commit/action@v3.0.0
+      - uses: pre-commit/action@v3.0.1
         env:
           SKIP: no-commit-to-branch
 
@@ -25,34 +25,43 @@ jobs:
       fail-fast: false
       matrix:
         python_version: ["3.10", "3.11"]
+        pytorch_version: ["2.3.1", "2.4.1", "2.5.1"]
     timeout-minutes: 20
 
     steps:
       - name: Check out repository code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Setup Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python_version }}
           cache: 'pip' # caching pip dependencies
+
+      - name: Install PyTorch
+        run: |
+          pip3 install torch==${{ matrix.pytorch_version }} --index-url https://download.pytorch.org/whl/cpu
 
       - name: Update requirements.txt
         run: |
           sed -i 's#^transformers.*#transformers @ git+https://github.com/huggingface/transformers.git@main#' requirements.txt
           sed -i 's#^peft.*#peft @ git+https://github.com/huggingface/peft.git@main#' requirements.txt
           sed -i 's#^accelerate.*#accelerate @ git+https://github.com/huggingface/accelerate.git@main#' requirements.txt
+          sed -i 's#^trl.*#trl @ git+https://github.com/huggingface/trl.git@main#' requirements.txt
+          sed -i 's#^datasets.*#datasets @ git+https://github.com/huggingface/datasets.git@main#' requirements.txt
 
       - name: Install dependencies
         run: |
           pip3 install --upgrade pip
           pip3 install --upgrade packaging
           pip3 install -U -e .
-          pip3 install -r requirements-tests.txt
+          python scripts/cutcrossentropy_install.py | sh
+          pip3 install -r requirements-dev.txt -r requirements-tests.txt
 
       - name: Run tests
         run: |
-          pytest --ignore=tests/e2e/ tests/
+          pytest -n8 --dist loadfile --ignore=tests/e2e/ --ignore=tests/patched/ tests/
+          pytest tests/patched/
 
       - name: cleanup pip cache
         run: |
@@ -76,17 +85,17 @@ jobs:
             num_gpus: 1
             axolotl_extras: mamba-ssm
             nightly_build: "true"
-          - cuda: 121
-            cuda_version: 12.1.1
+          - cuda: 124
+            cuda_version: 12.4.1
             python_version: "3.11"
-            pytorch: 2.3.1
+            pytorch: 2.4.1
             num_gpus: 1
-            axolotl_extras: mamba-ssm
+            axolotl_extras:
             nightly_build: "true"
           - cuda: 124
             cuda_version: 12.4.1
             python_version: "3.11"
-            pytorch: 2.4.0
+            pytorch: 2.5.1
             num_gpus: 1
             axolotl_extras:
             nightly_build: "true"

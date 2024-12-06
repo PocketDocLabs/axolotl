@@ -4,7 +4,7 @@ plugins:
   - axolotl.integrations.liger.LigerPlugin
 liger_rope: true
 liger_rms_norm: true
-liger_swiglu: true
+liger_glu_activation: true
 liger_fused_linear_cross_entropy: true
 
 strict: false
@@ -14,6 +14,10 @@ datasets:
   - path: mlabonne/FineTome-100k
     type: chat_template
     split: train[:20%]
+    field_messages: conversations
+    message_field_role: from
+    message_field_content: value
+
 dataset_prepared_path: last_run_prepared
 val_set_size: 0.02
 output_dir: ./outputs/out
@@ -31,7 +35,7 @@ wandb_log_model:
 gradient_accumulation_steps: 4
 micro_batch_size: 2
 num_epochs: 1
-optimizer: paged_adamw_8bit
+optimizer: adamw_torch
 lr_scheduler: cosine
 learning_rate: 2e-5
 

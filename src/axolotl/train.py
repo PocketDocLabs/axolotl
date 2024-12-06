@@ -10,7 +10,6 @@ from typing import Optional, Tuple, Union
 
 import torch
 import transformers.modelcard
-from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import save_fsdp_model
 from datasets import Dataset
@@ -24,7 +23,7 @@ from axolotl.core.tokenizer_utils import fix_untrained_tokens
 from axolotl.logging_config import configure_logging
 from axolotl.utils.dict import DictDefault
 from axolotl.utils.freeze import freeze_layers_except
-from axolotl.utils.models import load_model, load_tokenizer
+from axolotl.utils.models import load_model, load_processor, load_tokenizer
 from axolotl.utils.trainer import setup_trainer
 
 try:
@@ -69,6 +68,9 @@ def train(
         main_process_only=True,
     )
     tokenizer = load_tokenizer(cfg)
+    processor = None
+    if cfg.is_multimodal:
+        processor = load_processor(cfg, tokenizer)
 
     train_dataset = dataset_meta.train_dataset
     eval_dataset = dataset_meta.eval_dataset
@@ -94,10 +96,11 @@ def train(
     if cfg.adapter:
         msg += " and peft_config..."
     LOG.debug(msg)
-    # we wait unitl the last possible moment to setup Accelerator
-    Accelerator()
-    model, peft_config = load_model(cfg, tokenizer, inference=cli_args.inference)
-    model.generation_config.do_sample = True
+    model, peft_config = load_model(
+        cfg, tokenizer, processor=processor, inference=cli_args.inference
+    )
+    if model.generation_config is not None:
+        model.generation_config.do_sample = True
 
     model_ref = None
     if cfg.rl and cfg.rl != "orpo":
@@ -122,6 +125,7 @@ def train(
         eval_dataset,
         (model, model_ref, peft_config),
         tokenizer,
+        processor,
         total_num_steps,
     )
 
@@ -255,9 +259,31 @@ def train(
         model.save_pretrained(cfg.output_dir, safe_serialization=safe_serialization)
 
     if not cfg.hub_model_id:
+        from huggingface_hub import HfApi
+        from huggingface_hub.utils import RepositoryNotFoundError
+
         try:
-            trainer.create_model_card(model_name=cfg.output_dir.lstrip("./"))
-        except AttributeError:
+            # Check to make sure the base model is from HuggingFace not a local directory
+            hf_api = HfApi()
+            hf_api.model_info(cfg.base_model)
+
+            model_card_kwarg = {
+                "model_name": cfg.output_dir.lstrip("./")
+                .encode("utf-8")
+                .decode("utf-8")
+            }
+            if cfg.datasets is not None:
+                if cfg.rl is not None or cfg.reward_model:
+                    model_card_kwarg["dataset_name"] = [
+                        d["path"] for d in cfg.datasets if not Path(d["path"]).is_dir()
+                    ]
+                else:
+                    model_card_kwarg["dataset_tags"] = [
+                        d["path"] for d in cfg.datasets if not Path(d["path"]).is_dir()
+                    ]
+
+            trainer.create_model_card(**model_card_kwarg)
+        except (AttributeError, UnicodeDecodeError, RepositoryNotFoundError):
             pass
     elif cfg.hub_model_id:
         # defensively push to the hub to ensure the model card is updated

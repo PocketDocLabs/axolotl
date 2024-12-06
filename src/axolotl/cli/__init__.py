@@ -27,19 +27,24 @@ from transformers.utils import is_torch_bf16_gpu_available
 from transformers.utils.import_utils import _is_package_available
 
 from axolotl.common.cli import TrainerCliArgs, load_model_and_tokenizer
-from axolotl.integrations.base import PluginManager
 from axolotl.logging_config import configure_logging
 from axolotl.train import TrainDatasetMeta
+from axolotl.utils.chat_templates import (
+    get_chat_template,
+    get_chat_template_from_config,
+)
+from axolotl.utils.comet_ import setup_comet_env_vars
 from axolotl.utils.config import (
     normalize_cfg_datasets,
     normalize_config,
+    prepare_plugins,
     validate_config,
 )
 from axolotl.utils.data import load_prepare_dpo_datasets, prepare_dataset
 from axolotl.utils.dict import DictDefault
 from axolotl.utils.distributed import is_main_process
 from axolotl.utils.mlflow_ import setup_mlflow_env_vars
-from axolotl.utils.models import load_tokenizer
+from axolotl.utils.models import load_processor, load_tokenizer
 from axolotl.utils.tokenization import check_dataset_labels
 from axolotl.utils.trainer import prepare_opinionated_env, prepare_optim_env
 from axolotl.utils.wandb_ import setup_wandb_env_vars
@@ -53,8 +58,22 @@ LOG = logging.getLogger("axolotl.scripts")
 
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 
+AXOLOTL_LOGO = """
+     #@@ #@@      @@# @@#
+    @@  @@          @@  @@           =@@#                               @@                 #@    =@@#.
+    @@    #@@@@@@@@@    @@           #@#@=                              @@                 #@     .=@@
+      #@@@@@@@@@@@@@@@@@            =@# @#     ##=     ##    =####=+    @@      =#####+  =#@@###.   @@
+    @@@@@@@@@@/  +@@/  +@@          #@  =@=     #@=   @@   =@#+  +#@#   @@    =@#+  +#@#   #@.      @@
+    @@@@@@@@@@  ##@@  ##@@         =@#   @#      =@# @#    @@      @@   @@    @@      #@   #@       @@
+     @@@@@@@@@@@@@@@@@@@@          #@=+++#@=      =@@#     @@      @@   @@    @@      #@   #@       @@
+                                  =@#=====@@     =@# @#    @@      @@   @@    @@      #@   #@       @@
+    @@@@@@@@@@@@@@@@  @@@@        #@      #@=   #@=  +@@   #@#    =@#   @@.   =@#    =@#   #@.      @@
+                                 =@#       @#  #@=     #@   =#@@@@#=    +#@@=  +#@@@@#=    .##@@+   @@
+    @@@@  @@@@@@@@@@@@@@@@
+"""
 
-def print_axolotl_text_art(suffix=None):
+
+def print_legacy_axolotl_text_art(suffix=None):
     font = "nancyj"
     ascii_text = "  axolotl"
     if suffix:
@@ -67,6 +86,13 @@ def print_axolotl_text_art(suffix=None):
     print_dep_versions()
 
 
+def print_axolotl_text_art(
+    **kwargs,  # pylint: disable=unused-argument
+):
+    if is_main_process():
+        print(AXOLOTL_LOGO)
+
+
 def print_dep_versions():
     packages = ["accelerate", "peft", "transformers", "trl", "torch", "bitsandbytes"]
     max_len = max(len(pkg) for pkg in packages)
@@ -74,8 +100,8 @@ def print_dep_versions():
         print("*" * 40)
         print("**** Axolotl Dependency Versions *****")
         for pkg in packages:
-            version = _is_package_available(pkg, return_version=True)
-            print(f"{pkg: >{max_len}}: {version[1]: <15}")
+            pkg_version = _is_package_available(pkg, return_version=True)
+            print(f"{pkg: >{max_len}}: {pkg_version[1]: <15}")
         print("*" * 40)
 
 
@@ -113,7 +139,7 @@ def check_remote_config(config: Union[str, Path]):
         with open(output_path, "wb") as file:
             file.write(content)
         LOG.info(
-            f"Using the following config obtained from {config}:\n\n{content.decode('utf-8')}\n"
+            f"Using the following config obtained from {config}: \n\n{content.decode('utf-8')}\n"
         )
         return output_path
 
@@ -167,17 +193,18 @@ def do_inference(
 ):
     model, tokenizer = load_model_and_tokenizer(cfg=cfg, cli_args=cli_args)
     prompter = cli_args.prompter
-    default_tokens = {"unk_token": "<unk>", "bos_token": "<s>", "eos_token": "</s>"}
-
-    for token, symbol in default_tokens.items():
-        # If the token isn't already specified in the config, add it
-        if not (cfg.special_tokens and token in cfg.special_tokens):
-            tokenizer.add_special_tokens({token: symbol})
 
     prompter_module = None
+    chat_template_str = None
     if prompter:
         prompter_module = getattr(
             importlib.import_module("axolotl.prompters"), prompter
+        )
+    elif cfg.chat_template:
+        chat_template_str = get_chat_template(cfg.chat_template)
+    elif cfg.datasets[0].type == "chat_template":
+        chat_template_str = get_chat_template_from_config(
+            cfg=cfg, ds_cfg=cfg.datasets[0], tokenizer=tokenizer
         )
 
     model = model.to(cfg.device, dtype=cfg.torch_dtype)
@@ -188,13 +215,31 @@ def do_inference(
         instruction = get_multi_line_input()
         if not instruction:
             return
+
         if prompter_module:
             prompt: str = next(
                 prompter_module().build_prompt(instruction=instruction.strip("\n"))
             )
         else:
             prompt = instruction.strip()
-        batch = tokenizer(prompt, return_tensors="pt", add_special_tokens=True)
+
+        if chat_template_str:
+            batch = tokenizer.apply_chat_template(
+                [
+                    {
+                        "role": "user",
+                        "content": prompt,
+                    }
+                ],
+                return_tensors="pt",
+                add_special_tokens=True,
+                add_generation_prompt=True,
+                chat_template=chat_template_str,
+                tokenize=True,
+                return_dict=True,
+            )
+        else:
+            batch = tokenizer(prompt, return_tensors="pt", add_special_tokens=True)
 
         print("=" * 40)
         model.eval()
@@ -234,18 +279,15 @@ def do_inference_gradio(
 
     model, tokenizer = load_model_and_tokenizer(cfg=cfg, cli_args=cli_args)
     prompter = cli_args.prompter
-    default_tokens = {"unk_token": "<unk>", "bos_token": "<s>", "eos_token": "</s>"}
-
-    for token, symbol in default_tokens.items():
-        # If the token isn't already specified in the config, add it
-        if not (cfg.special_tokens and token in cfg.special_tokens):
-            tokenizer.add_special_tokens({token: symbol})
 
     prompter_module = None
+    chat_template_str = None
     if prompter:
         prompter_module = getattr(
             importlib.import_module("axolotl.prompters"), prompter
         )
+    elif cfg.chat_template:
+        chat_template_str = get_chat_template(cfg.chat_template, tokenizer=tokenizer)
 
     model = model.to(cfg.device, dtype=cfg.torch_dtype)
 
@@ -259,7 +301,24 @@ def do_inference_gradio(
             )
         else:
             prompt = instruction.strip()
-        batch = tokenizer(prompt, return_tensors="pt", add_special_tokens=True)
+
+        if chat_template_str:
+            batch = tokenizer.apply_chat_template(
+                [
+                    {
+                        "role": "user",
+                        "content": prompt,
+                    }
+                ],
+                return_tensors="pt",
+                add_special_tokens=True,
+                add_generation_prompt=True,
+                chat_template=chat_template_str,
+                tokenize=True,
+                return_dict=True,
+            )
+        else:
+            batch = tokenizer(prompt, return_tensors="pt", add_special_tokens=True)
 
         model.eval()
         with torch.no_grad():
@@ -282,6 +341,7 @@ def do_inference_gradio(
             streamer = TextIteratorStreamer(tokenizer)
             generation_kwargs = {
                 "inputs": batch["input_ids"].to(cfg.device),
+                "attention_mask": batch["attention_mask"].to(cfg.device),
                 "generation_config": generation_config,
                 "streamer": streamer,
             }
@@ -320,7 +380,7 @@ def choose_config(path: Path):
 
     if len(yaml_files) == 1:
         print(f"Using default YAML file '{yaml_files[0]}'")
-        return yaml_files[0]
+        return str(yaml_files[0])
 
     print("Choose a YAML file:")
     for idx, file in enumerate(yaml_files):
@@ -331,7 +391,7 @@ def choose_config(path: Path):
         try:
             choice = int(input("Enter the number of your choice: "))
             if 1 <= choice <= len(yaml_files):
-                chosen_file = yaml_files[choice - 1]
+                chosen_file = str(yaml_files[choice - 1])
             else:
                 print("Invalid choice. Please choose a number from the list.")
         except ValueError:
@@ -366,16 +426,13 @@ def load_cfg(config: Union[str, Path] = Path("examples/"), **kwargs):
 
     cfg.axolotl_config_path = config
 
-    if cfg.get("plugins"):
-        plugin_manager = PluginManager.get_instance()
-        for plugin_name in cfg["plugins"]:
-            plugin_manager.register(plugin_name)
-
     try:
         device_props = torch.cuda.get_device_properties("cuda")
         gpu_version = "sm_" + str(device_props.major) + str(device_props.minor)
     except:  # pylint: disable=bare-except # noqa: E722
         gpu_version = None
+
+    prepare_plugins(cfg)
 
     cfg = validate_config(
         cfg,
@@ -383,6 +440,9 @@ def load_cfg(config: Union[str, Path] = Path("examples/"), **kwargs):
             "bf16": is_torch_bf16_gpu_available(),
             "n_gpu": int(os.environ.get("WORLD_SIZE", 1)),
             "compute_capability": gpu_version,
+        },
+        env_capabilities={
+            "torch_version": str(torch.__version__).split("+", maxsplit=1)[0]
         },
     )
 
@@ -398,6 +458,8 @@ def load_cfg(config: Union[str, Path] = Path("examples/"), **kwargs):
 
     setup_mlflow_env_vars(cfg)
 
+    setup_comet_env_vars(cfg)
+
     return cfg
 
 
@@ -407,12 +469,20 @@ def load_datasets(
     cli_args: TrainerCliArgs,
 ) -> TrainDatasetMeta:
     tokenizer = load_tokenizer(cfg)
+    processor = load_processor(cfg, tokenizer=tokenizer) if cfg.processor_type else None
 
     train_dataset, eval_dataset, total_num_steps, prompters = prepare_dataset(
-        cfg, tokenizer
+        cfg,
+        tokenizer,
+        processor=processor,
     )
 
-    if cli_args.debug or cfg.debug:
+    if (
+        cli_args.debug
+        or cfg.debug
+        or cli_args.debug_text_only
+        or int(cli_args.debug_num_examples) > 0
+    ):
         LOG.info("check_dataset_labels...")
         check_dataset_labels(
             train_dataset.select(

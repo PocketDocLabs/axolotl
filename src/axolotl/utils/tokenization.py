@@ -1,8 +1,6 @@
 """Module for tokenization utilities"""
 
 import logging
-import re
-from typing import Dict, List
 
 from termcolor import colored
 
@@ -68,90 +66,47 @@ def process_tokens_for_rl_debug(tokens, color, tokenizer, text_only):
 
 
 def check_rl_example_labels(example, tokenizer, text_only=False):
-    field_prompt, field_chosen, field_rejected = "prompt", "chosen", "rejected"
+    field_prompt, field_chosen, field_rejected, field_completion = (
+        "prompt",
+        "chosen",
+        "rejected",
+        "completion",
+    )
 
     input_tokens = example[field_prompt]
-    labels_chosen, labels_rejected = example[field_chosen], example[field_rejected]
+
+    labels_chosen = example.get(field_chosen)
+    labels_rejected = example.get(field_rejected)
+    labels_completion = example.get(field_completion)
+
+    # Create a delimiter based on text_only flag
+    delimiter = "" if text_only else " "
 
     # Process and color each type of token
     colored_tokens = process_tokens_for_rl_debug(
         input_tokens, "yellow", tokenizer, text_only
     )
-    colored_chosens = process_tokens_for_rl_debug(
-        labels_chosen, "green", tokenizer, text_only
-    )
-    colored_rejecteds = process_tokens_for_rl_debug(
-        labels_rejected, "red", tokenizer, text_only
-    )
 
-    # Create a delimiter based on text_only flag
-    delimiter = "" if text_only else " "
+    # Process tokens
+    if labels_completion is None:
+        colored_chosens = process_tokens_for_rl_debug(
+            labels_chosen, "green", tokenizer, text_only
+        )
+        colored_rejecteds = process_tokens_for_rl_debug(
+            labels_rejected, "red", tokenizer, text_only
+        )
+    else:
+        colored_completion = process_tokens_for_rl_debug(
+            labels_completion, "green", tokenizer, text_only
+        )
 
     # Logging information
     LOG.info(f"INPUT PROMPT: {delimiter.join(colored_tokens)}\n\n")
-    LOG.info(f"CHOSEN RESPONSE: {delimiter.join(colored_chosens)}\n\n")
-    LOG.info(f"REJECTED RESPONSE: {delimiter.join(colored_rejecteds)}\n\n\n")
+
+    if labels_completion is None:
+        LOG.info(f"CHOSEN RESPONSE: {delimiter.join(colored_chosens)}\n\n")
+        LOG.info(f"REJECTED RESPONSE: {delimiter.join(colored_rejecteds)}\n\n\n")
+    else:
+        LOG.info(f"COMPLETION RESPONSE: {delimiter.join(colored_completion)}\n\n\n")
 
     return delimiter.join(colored_tokens)
-
-
-GLAIVE_ROLES = ["USER", "ASSISTANT", "FUNCTION RESPONSE"]
-GLAIVE_TO_SHAREGPT_ROLE = {
-    "SYSTEM": "system",
-    "USER": "human",
-    "ASSISTANT": "gpt",
-    "FUNCTION RESPONSE": "tool",
-}
-
-GLAIVE_MSG_REGEX = re.compile(rf"({'|'.join(GLAIVE_ROLES)}): ")
-
-
-def chatml_to_conversation(row: Dict[str, str]) -> List[Dict[str, str]]:
-    """
-    Converts a ChatML formatted row to a list of messages in ShareGPT format.
-    Initially based off https://github.com/lilacai/lilac/blob/main/notebooks/GlaiveToShareGPT.ipynb.
-    """
-
-    system_prompt = row.get("system")
-    if system_prompt:
-        system_prompt = system_prompt.removeprefix("SYSTEM: ")
-
-    chat_str = row["chat"]
-    chat_msgs = [s.strip() for s in GLAIVE_MSG_REGEX.split(chat_str) if s]
-
-    chat_msg_dicts = [
-        {"from": GLAIVE_TO_SHAREGPT_ROLE[role], "value": value}
-        for role, value in zip(chat_msgs[::2], chat_msgs[1::2])
-    ]
-
-    if system_prompt:
-        chat_msg_dicts = [
-            {"from": GLAIVE_TO_SHAREGPT_ROLE["SYSTEM"], "value": system_prompt}
-        ] + chat_msg_dicts
-
-    return chat_msg_dicts
-
-
-def merge_consecutive_messages(messages):
-    """
-    Merge consecutive messages from the same sender into a single message.
-    This can be useful with datasets that contain multiple consecutive tool calls.
-    """
-
-    merged_messages = []
-    current_from = None
-    current_message = ""
-
-    for msg in messages:
-        if current_from == msg["from"]:
-            current_message += msg["value"]
-        else:
-            if current_from is not None:
-                merged_messages.append({"from": current_from, "value": current_message})
-            current_from = msg["from"]
-            current_message = msg["value"]
-
-    if current_from is not None:
-        merged_messages.append({"from": current_from, "value": current_message})
-
-    return merged_messages

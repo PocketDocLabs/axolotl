@@ -11,12 +11,13 @@ import numpy as np
 import torch
 import torch.cuda
 from accelerate.logging import get_logger
-from datasets import set_caching_enabled
+from datasets import disable_caching, enable_caching
 from torch.utils.data import DataLoader, RandomSampler
 from transformers.utils import is_torch_bf16_gpu_available
 
 from axolotl.core.trainer_builder import HFCausalTrainerBuilder, HFRLTrainerBuilder
 from axolotl.utils.distributed import reduce_and_broadcast
+from axolotl.utils.environment import check_cuda_p2p_ib_support
 from axolotl.utils.samplers import MultipackBatchSampler, get_dataset_lengths
 
 LOG = get_logger("axolotl")
@@ -87,10 +88,10 @@ def trainer_weighted_loss(model_output, labels, shift_labels=True):
 @contextmanager
 def disable_datasets_caching():
     try:
-        set_caching_enabled(False)
+        disable_caching()
         yield
     finally:
-        set_caching_enabled(True)
+        enable_caching()
 
 
 def add_position_ids(sample):
@@ -184,11 +185,10 @@ def process_datasets_for_packing(cfg, train_dataset, eval_dataset):
         min_sequence_len=cfg.min_sample_len or 2,
     )
 
-    if cfg.is_preprocess:
-        min_input_len = np.min(get_dataset_lengths(train_dataset))
-        LOG.debug(f"min_input_len: {min_input_len}", main_process_only=True)
-        max_input_len = np.max(get_dataset_lengths(train_dataset))
-        LOG.debug(f"max_input_len: {max_input_len}", main_process_only=True)
+    min_input_len = np.min(get_dataset_lengths(train_dataset))
+    LOG.debug(f"min_input_len: {min_input_len}", main_process_only=True)
+    max_input_len = np.max(get_dataset_lengths(train_dataset))
+    LOG.debug(f"max_input_len: {max_input_len}", main_process_only=True)
 
     if cfg.model_config_type == "mamba":
         LOG.info("dropping attention_mask column")
@@ -203,37 +203,59 @@ def process_datasets_for_packing(cfg, train_dataset, eval_dataset):
         if eval_dataset and "token_type_ids" in eval_dataset.column_names:
             eval_dataset = eval_dataset.remove_columns("token_type_ids")
 
+    prior_len = len(train_dataset)
     train_dataset = train_dataset.filter(
         drop_long,
         num_proc=cfg.dataset_processes,
         load_from_cache_file=not cfg.is_preprocess,
         desc="Dropping Long Sequences",
     )
+    dropped = prior_len - len(train_dataset)
+    if dropped:
+        LOG.warning(f"Dropped {dropped} long samples from train dataset")
+
     if eval_dataset:
+        prior_len = len(eval_dataset)
         eval_dataset = eval_dataset.filter(
             drop_long,
             num_proc=cfg.dataset_processes,
             load_from_cache_file=not cfg.is_preprocess,
             desc="Dropping Long Sequences",
         )
+        dropped = prior_len - len(eval_dataset)
+        if dropped:
+            LOG.warning(f"Dropped {dropped} long samples from eval dataset")
 
     # drop samples with where the number of elements with labels not equal to -100 is zero
     def drop_no_trainable_tokens(sample):
         return np.sum(np.array(sample["labels"]) != -100) > 0
 
+    prior_len = len(train_dataset)
     train_dataset = train_dataset.filter(
         drop_no_trainable_tokens,
         num_proc=cfg.dataset_processes,
         load_from_cache_file=not cfg.is_preprocess,
         desc="Drop Samples with Zero Trainable Tokens",
     )
+    dropped = prior_len - len(train_dataset)
+    if dropped:
+        LOG.warning(
+            f"Dropped {dropped} samples with no trainable tokens from train dataset"
+        )
+
     if eval_dataset:
+        prior_len = len(eval_dataset)
         eval_dataset = eval_dataset.filter(
             drop_no_trainable_tokens,
             num_proc=cfg.dataset_processes,
             load_from_cache_file=not cfg.is_preprocess,
             desc="Drop Samples with Zero Trainable Tokens",
         )
+        dropped = prior_len - len(eval_dataset)
+        if dropped:
+            LOG.warning(
+                f"Dropped {dropped} samples with no trainable tokens from eval dataset"
+            )
 
     if cfg.group_by_length:
         train_dataset = train_dataset.map(
@@ -306,7 +328,11 @@ def process_pretraining_datasets_for_packing(
 
 
 def calculate_total_num_steps(cfg, train_dataset, update=True):
-    if not cfg.total_num_tokens:
+    if (
+        not cfg.total_num_tokens
+        and not cfg.skip_prepare_dataset
+        and not cfg.reward_model
+    ):
         total_num_tokens = np.sum(
             train_dataset.data.column("input_ids")
             .to_pandas()
@@ -319,7 +345,12 @@ def calculate_total_num_steps(cfg, train_dataset, update=True):
 
     skip_estimates = cfg.model_config_type == "mamba"
 
-    if not skip_estimates and not cfg.total_supervised_tokens:
+    if (
+        not skip_estimates
+        and not cfg.total_supervised_tokens
+        and not cfg.skip_prepare_dataset
+        and not cfg.reward_model
+    ):
         total_supervised_tokens = (
             train_dataset.data.column("labels")
             .to_pandas()
@@ -357,7 +388,7 @@ def calculate_total_num_steps(cfg, train_dataset, update=True):
                 main_process_only=True,
             )
         else:
-            if cfg.flash_attention:
+            if cfg.flash_attention and not cfg.multipack_real_batches:
                 sampler_batch_size = 1
                 batch_max_len = cfg.micro_batch_size * cfg.sequence_len
             else:
@@ -425,7 +456,8 @@ def setup_deepspeed_env(cfg, stage=None):
         os.environ["ACCELERATE_DEEPSPEED_ZERO_STAGE"] = str(stage)
         if stage == 3:
             os.environ["ACCELERATE_DEEPSPEED_ZERO3_INIT"] = "true"
-    HfTrainerDeepSpeedConfig(cfg.deepspeed)
+    # If we don't assign this, it doesn't actually get set in the accelerate weakref
+    _ = HfTrainerDeepSpeedConfig(cfg.deepspeed)
 
 
 def setup_fsdp_envs(cfg):
@@ -451,6 +483,9 @@ def setup_fsdp_envs(cfg):
 
 
 def prepare_optim_env(cfg):
+    if not check_cuda_p2p_ib_support():
+        if os.getenv("NCCL_P2P_DISABLE") is None:
+            os.environ["NCCL_P2P_DISABLE"] = "1"
     if cfg.fsdp:
         setup_fsdp_envs(cfg)
     elif cfg.deepspeed:
@@ -477,13 +512,15 @@ def prepare_opinionated_env(cfg):
         os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
-def setup_trainer(cfg, train_dataset, eval_dataset, model, tokenizer, total_num_steps):
-    if cfg.rl in ["dpo", "ipo", "orpo", "kto", "simpo"]:
-        trainer_builder = HFRLTrainerBuilder(cfg, model[0], tokenizer)
+def setup_trainer(
+    cfg, train_dataset, eval_dataset, model, tokenizer, processor, total_num_steps
+):
+    if cfg.rl in ("dpo", "ipo", "orpo", "kto", "simpo"):
+        trainer_builder = HFRLTrainerBuilder(cfg, model[0], tokenizer, processor)
         trainer_builder.model_ref = model[1]
         trainer_builder.peft_config = model[2]
     else:
-        trainer_builder = HFCausalTrainerBuilder(cfg, model[0], tokenizer)
+        trainer_builder = HFCausalTrainerBuilder(cfg, model[0], tokenizer, processor)
 
     trainer_builder.train_dataset = train_dataset
     trainer_builder.eval_dataset = eval_dataset
